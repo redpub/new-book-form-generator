@@ -1,0 +1,19 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Start Streamlit",
+            "type": "shell",
+            "command": "pgrep -f 'streamlit run streamlit_app.py' > /dev/null || nohup .venv/bin/streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.enableCORS false --server.enableXsrfProtection false --browser.gatherUsageStats false > /tmp/streamlit.log 2>&1 &",
+            "runOptions": {
+                "runOn": "folderOpen"
+            },
+            "presentation": {
+                "reveal": "silent",
+                "panel": "shared",
+                "close": true
+            },
+            "problemMatcher": []
+        }
+    ]
+}
