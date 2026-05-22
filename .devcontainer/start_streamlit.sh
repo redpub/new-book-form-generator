@@ -25,6 +25,6 @@ nohup $VENV run streamlit_app.py \
     --server.headless true \
     --server.showEmailPrompt false \
     --server.enableCORS false \
-    --server.enableXsrfProtection false \
+    --browser.gatherUsageStats false \
     --browser.gatherUsageStats false \
     > "$LOG" 2>&1 &
