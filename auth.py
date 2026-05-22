@@ -7,6 +7,9 @@ from app_config import ALLOWED_EMAIL_DOMAIN
 
 def enforce_workspace_auth() -> None:
     """Verify Google OAuth login and enforce @red-publish.com domain."""
+    if str(st.secrets.get("DISABLE_LOGIN", "false")).lower() == "true":
+        return
+
     auth_settings = st.secrets.get("auth", {})
     if hasattr(auth_settings, "items"):
         auth_settings = dict(auth_settings.items())
