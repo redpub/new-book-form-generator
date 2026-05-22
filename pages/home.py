@@ -852,7 +852,7 @@ def _count_visible_fields(section: dict) -> int:
 def main() -> None:
     enforce_workspace_auth()
 
-    st.title("📝 新書表單產生器")
+    st.title("📝 紅出版 新書表單產生器")
     st.caption("上傳新書Media Letter，轉換成新書資料表格。")
 
     with st.sidebar:
