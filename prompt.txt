@@ -9,36 +9,65 @@ Output ONLY a single raw JSON object. Follow these formatting rules strictly:
 - The output must parse successfully with JSON.parse() / json.loads() without any errors
 
 Schema (all keys must exist, values can be empty strings when unknown):
-{
-  "title": "",
-  "subtitle": "",
-  "series": "",
-  "author_name": "",
-  "author_bio": "",
-  "target_audience": "",
-  "synopsis": "",
-  "isbn": "",
-  "publication_date": "",
-  "language": "",
-  "category": "",
-  "keywords": [],
-  "page_count": "",
-  "trim_size": "",
-  "price": "",
-  "contributor": "",
-  "editor_notes": "",
-  "extras": {}
-}
+{FIELD_REFERENCE}
 
-Example of CORRECT escaping (author_bio contains a quoted title):
-"author_bio": "曾獲「優秀共產黨員」稱號，著有《論語新解》一書。"
+Field-specific rules:
+
+1. publication_date
+   Return the publication date in DD/MM/YY format ONLY (two-digit year).
+   Example: 30 April 2026 → "30/04/26". May 2026 without a specific day → "01/05/26".
+   If the date is not clearly stated in the document, return "".
+
+2. contributor (translator)
+   Return the translator's name ONLY if the document EXPLICITLY labels a person as 譯者 or
+   translator using those exact words or a clear equivalent. If it is not explicitly stated,
+   or you are in any doubt, return "" — do NOT infer or guess from context.
+
+3. synopsis
+   Return as an HTML-formatted string using ONLY these tags: <b>, <i>, <u>, <ul>, <ol>, <li>.
+   - ALWAYS format every point, paragraph, or sentence as a bullet list item: <ul><li>…</li></ul>.
+   - If the source has multiple distinct paragraphs, turn EACH paragraph into its own <li> item.
+   - If the source already uses numbered lists, use <ol><li>…</li></ol> for those items.
+   - Preserve bold, italic, and underline emphasis from the source document inside the <li> tags.
+   - Do NOT use <p> tags. Do NOT include <html>, <body>, <div>, <span>, or any other tags.
+   - There must be NO plain text outside of a <li> element.
+
+4. author_bio
+   Return as an HTML-formatted string. Use ONLY these tags: <b>, <i>, <u>, <p>, <ul>, <ol>, <li>.
+   - Wrap each distinct paragraph in <p>…</p>.
+   - Convert any list items to <ul><li>…</li></ul> or <ol><li>…</li></ol> as appropriate.
+   - Preserve bold, italic, and underline emphasis from the source document.
+   - Do NOT include <html>, <body>, <div>, <span>, or any other tags.
+
+5. book_highlights
+   Extract the book's key selling points / features section (本書特色及賣點).
+   Apply the same HTML bullet-list formatting rules as synopsis (rule 3): always use <ul><li>…</li></ul>, no <p> tags, no plain text outside <li>.
+   If no such section exists in the document, return "".
+
+6. language
+   Return as an array of strings. Include ONLY the values that apply from this fixed set:
+   中文, 繁體, 簡體, 英文, 中英對照
+   Example: a Traditional Chinese book → ["中文", "繁體"]
+   Return [] if the language cannot be determined from the document.
+
+7. thickness
+   Book spine thickness (書脊厚度) in mm, as a plain numeric string (e.g. "20").
+   Return "" if the thickness is not stated in the document.
+
+8. All other string fields
+   Return plain text with NO markdown or HTML formatting markers whatsoever.
+
+Examples of CORRECT values:
+  "synopsis": "<ul><li>本書探討現代社會中的人際關係。</li><li><b>深入淺出</b></li><li>案例豐富</li></ul>"
+  "book_highlights": "<ul><li>全彩印刷，圖文並茂</li><li>適合初學者及進階讀者</li></ul>"
+  "author_bio": "<p>曾獲「優秀作家」稱號，著有《論語新解》一書。</p>"
+  "publication_date": "30/04/26"
+  "contributor": ""   ← correct when translator is not explicitly stated
 
 Example of WRONG output that breaks JSON parsing:
-"author_bio": "曾獲"優秀共產黨員"稱號"   ← INVALID: unescaped " breaks the JSON
+  "author_bio": "曾獲"優秀作家"稱號"   ← INVALID: unescaped " breaks the JSON
 
-Rules:
-1. Never invent facts. Use empty string if not found.
+General rules:
+1. Never invent facts. Use empty string if not found or not sure.
 2. Keep wording concise and faithful to source.
-3. For keywords, return a short array of strings.
-4. extras can include additional useful key-value pairs not in main schema.
-5. Output only the raw JSON object — nothing else.
+3. Output only the raw JSON object — nothing else.

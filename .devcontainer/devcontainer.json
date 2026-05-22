@@ -17,9 +17,9 @@
     }
   },
   // 容器建立後跑一次：建立 venv + 安裝套件
-  "postCreateCommand": "python -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install -r requirements.txt",
-  // 每次 attach (開啟 VS Code) 時在背景啟動 Streamlit（避免阻塞終端）
-  "postAttachCommand": "bash -lc 'pgrep -f \"streamlit run streamlit_app.py\" >/dev/null || nohup .venv/bin/streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.enableCORS false --server.enableXsrfProtection false --browser.gatherUsageStats false >/tmp/streamlit.log 2>&1 &'",
+  "postCreateCommand": "python -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install -r requirements.txt && mkdir -p /home/vscode/.streamlit && printf '[general]\nemail = \"admin@red-publish.com\"\n' > /home/vscode/.streamlit/credentials.toml",
+  // 每次容器啟動時在背景啟動 Streamlit
+  "postStartCommand": "/bin/bash .devcontainer/start_streamlit.sh",
   "forwardPorts": [
     8501
   ],

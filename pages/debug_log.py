@@ -6,7 +6,7 @@ from datetime import datetime
 import streamlit as st
 
 from auth import enforce_workspace_auth
-from debug_store import get_runs
+from debug_store import get_runs, get_run_detail
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +44,22 @@ def _show_run_detail(run: dict) -> None:
     c1.metric("狀態", "成功" if run["success"] else "失敗")
     c2.metric("模型", run["model"])
     c3.metric("耗時", _fmt_elapsed(run["elapsed_seconds"]))
-    c4.metric("時間", _fmt_timestamp(run["timestamp"]))
+    c4.metric("時間", _fmt_timestamp(run.get("created_at", "")))
+
+    if run.get("user_email"):
+        st.caption(f"使用者：{run['user_email']}")
 
     if run.get("error_message"):
         st.error(f"錯誤訊息：{run['error_message']}")
+
+    # Source file download
+    if run.get("source_file"):
+        st.download_button(
+            label="⬇️ 下載原始 Word 檔案",
+            data=run["source_file"],
+            file_name=run["file_name"],
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
 
     with st.expander("📤 原始 Prompt", expanded=False):
         st.text(run.get("raw_prompt") or "（無資料）")
@@ -72,11 +84,11 @@ def main() -> None:
 
     st.title("🔍 除錯紀錄")
     st.caption(
-        "查看所有 Straico 擷取操作的詳細紀錄，包含使用模型、耗時、原始 Prompt 與 LLM 回應。"
+        "查看所有擷取操作的詳細紀錄，包含使用模型、耗時、原始 Prompt 與 LLM 回應。"
     )
 
     with st.sidebar:
-        st.subheader("帳號")
+        st.header("⚙️ 設定")
         st.caption(f"已登入：{getattr(st.user, 'email', '未知帳號')}")
         if st.button("登出", key="sidebar_logout"):
             st.logout()
@@ -96,39 +108,37 @@ def main() -> None:
         if st.button("⬅️ 返回列表"):
             st.session_state.selected_run_id = None
             st.rerun()
-        matched = next(
-            (r for r in runs if r["id"] ==
-             st.session_state.selected_run_id), None
-        )
-        if matched:
-            _show_run_detail(matched)
+        run_detail = get_run_detail(st.session_state.selected_run_id)
+        if run_detail:
+            _show_run_detail(run_detail)
         else:
-            st.warning("找不到該紀錄，可能已因伺服器重啟而消失。")
+            st.warning("找不到該紀錄。")
             st.session_state.selected_run_id = None
         return
 
     # ---- List view ----
     st.subheader(f"最近 {len(runs)} 筆紀錄")
-    st.caption("⚠️ 紀錄僅保存至伺服器重啟為止，重啟後將清空。")
 
     # Table header
-    hcols = st.columns([0.5, 1.8, 2.5, 2.8, 1.2, 1])
+    hcols = st.columns([0.5, 1.8, 2.5, 2.0, 1.8, 1.2, 1])
     hcols[0].markdown("**狀態**")
     hcols[1].markdown("**時間**")
     hcols[2].markdown("**檔案**")
-    hcols[3].markdown("**模型**")
-    hcols[4].markdown("**耗時**")
-    hcols[5].markdown("")
+    hcols[3].markdown("**使用者**")
+    hcols[4].markdown("**模型**")
+    hcols[5].markdown("**耗時**")
+    hcols[6].markdown("")
     st.markdown("<hr style='margin:4px 0;'>", unsafe_allow_html=True)
 
     for run in runs:
-        cols = st.columns([0.5, 1.8, 2.5, 2.8, 1.2, 1])
+        cols = st.columns([0.5, 1.8, 2.5, 2.0, 1.8, 1.2, 1])
         cols[0].write(_status_icon(run["success"]))
-        cols[1].caption(_fmt_timestamp(run["timestamp"]))
+        cols[1].caption(_fmt_timestamp(run.get("created_at", "")))
         cols[2].write(run["file_name"])
-        cols[3].caption(run["model"])
-        cols[4].caption(_fmt_elapsed(run["elapsed_seconds"]))
-        if cols[5].button("查看", key=f"view_{run['id']}"):
+        cols[3].caption(run.get("user_email") or "—")
+        cols[4].caption(run["model"])
+        cols[5].caption(_fmt_elapsed(run["elapsed_seconds"]))
+        if cols[6].button("查看", key=f"view_{run['id']}"):
             st.session_state.selected_run_id = run["id"]
             st.rerun()
         st.markdown(
