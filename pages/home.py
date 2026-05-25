@@ -726,6 +726,19 @@ def build_initial_form_values(extracted_flat: dict[str, str]) -> dict[str, str]:
     """
     trim_size = extracted_flat.get("trim_size", "")
     lang_str = extracted_flat.get("language", "")
+
+    # Parse both trim dimensions, then assign larger → 長 (#trim_width) and
+    # smaller → 闊 (#trim_height), regardless of order in the source string.
+    _raw0 = _parse_trim_dimension(trim_size, 0)
+    _raw1 = _parse_trim_dimension(trim_size, 1)
+    try:
+        _d0, _d1 = float(_raw0 or 0), float(_raw1 or 0)
+        _trim_長 = _mm_to_cm(str(max(_d0, _d1))) if max(_d0, _d1) else ""
+        _trim_闊 = _mm_to_cm(str(min(_d0, _d1))) if min(_d0, _d1) else ""
+    except (ValueError, TypeError):
+        _trim_長 = _mm_to_cm(_raw0) if _raw0 else ""
+        _trim_闊 = _mm_to_cm(_raw1) if _raw1 else ""
+
     values: dict[str, str] = {}
     for section in SECTIONS:
         for field in section["fields"]:
@@ -734,11 +747,9 @@ def build_initial_form_values(extracted_flat: dict[str, str]) -> dict[str, str]:
                 continue
             src = field.get("source_key", "")
             if src == "#trim_width":
-                values[ph] = _parse_trim_dimension(
-                    trim_size, 0) or _field_default(field)
+                values[ph] = _trim_長 or _field_default(field)
             elif src == "#trim_height":
-                values[ph] = _parse_trim_dimension(
-                    trim_size, 1) or _field_default(field)
+                values[ph] = _trim_闊 or _field_default(field)
             elif src.startswith("#lang:"):
                 keyword = src[len("#lang:"):]
                 values[ph] = CHECKBOX_CHAR if keyword in lang_str else UNCHECKED_CHAR
@@ -746,6 +757,8 @@ def build_initial_form_values(extracted_flat: dict[str, str]) -> dict[str, str]:
                 raw = extracted_flat[src]
                 if ph == "publishDate":
                     raw = _format_date_ddmmyy(raw)
+                elif ph in _CM_PLACEHOLDERS and raw:
+                    raw = _mm_to_cm(raw)
                 values[ph] = raw or _field_default(field)
             else:
                 values[ph] = _field_default(field)
@@ -853,7 +866,6 @@ def main() -> None:
     enforce_workspace_auth()
 
     st.title("📝 紅出版 新書表單產生器")
-    st.caption("上傳新書Media Letter，轉換成新書資料表格。")
 
     with st.sidebar:
         st.header("⚙️ 設定")
@@ -881,7 +893,7 @@ def main() -> None:
         st.stop()
 
     uploaded_file = st.file_uploader(
-        "選擇 Media Letter Word 檔案（每次只能選一個 .docx 檔）", type=["docx"]
+        "上傳新書Media Letter Word檔 (docx)，轉換成新書資料表格。", type=["docx"]
     )
     extract_clicked = st.button("提交", type="primary")
 
@@ -972,15 +984,36 @@ def main() -> None:
                 st.subheader(section["title"])
 
             if layout == "grid":
-                # 2-column grid for non-checkbox fields; checkboxes (if any) after
+                # Grid layout: row_group fields share a row; ungrouped fields pair 2-per-row
                 others = [f for f in fields if f["type"]
                           != "checkbox" and not f.get("hidden")]
                 checkboxes = [f for f in fields if f["type"]
                               == "checkbox" and not f.get("hidden")]
-                for i in range(0, len(others), 2):
-                    pair = others[i:i + 2]
-                    cols = st.columns(2)
-                    for col, field in zip(cols, pair):
+
+                # Build row batches
+                _row_batches: list[list[dict]] = []
+                _ri = 0
+                while _ri < len(others):
+                    _rg = others[_ri].get("row_group")
+                    if _rg:
+                        _grp = [others[_ri]]
+                        _rj = _ri + 1
+                        while _rj < len(others) and others[_rj].get("row_group") == _rg:
+                            _grp.append(others[_rj])
+                            _rj += 1
+                        _row_batches.append(_grp)
+                        _ri = _rj
+                    else:
+                        if _ri + 1 < len(others) and not others[_ri + 1].get("row_group"):
+                            _row_batches.append([others[_ri], others[_ri + 1]])
+                            _ri += 2
+                        else:
+                            _row_batches.append([others[_ri]])
+                            _ri += 1
+
+                for _row_fields in _row_batches:
+                    cols = st.columns(len(_row_fields))
+                    for col, field in zip(cols, _row_fields):
                         ph = field["placeholder"]
                         key = f"form_{ph}"
                         hint = field.get("hint") or None
@@ -1083,6 +1116,48 @@ def main() -> None:
                         if field["type"] == "label":
                             st.markdown(f"**{field['label']}**")
                             idx += 1
+                        elif field.get("row_group"):
+                            _rg = field["row_group"]
+                            _rg_fields = [field]
+                            _look = idx + 1
+                            while _look < len(fields) and fields[_look].get("row_group") == _rg:
+                                _rg_fields.append(fields[_look])
+                                _look += 1
+                            _rg_cols = st.columns(len(_rg_fields))
+                            for _rg_col, _rg_field in zip(_rg_cols, _rg_fields):
+                                _ph = _rg_field["placeholder"]
+                                _key = f"form_{_ph}"
+                                _hint = _rg_field.get("hint") or None
+                                _opts = _rg_field.get("options")
+                                with _rg_col:
+                                    if _rg_field["type"] == "date":
+                                        if _key not in st.session_state:
+                                            st.date_input(_rg_field["label"], value=_parse_to_date(
+                                                fv.get(_ph, "")), key=_key, format="DD/MM/YYYY")
+                                        else:
+                                            st.date_input(
+                                                _rg_field["label"], key=_key, format="DD/MM/YYYY")
+                                    elif _opts:
+                                        _cur = fv.get(_ph, "")
+                                        _sidx = _opts.index(
+                                            _cur) if _cur in _opts else 0
+                                        st.selectbox(
+                                            _rg_field["label"], options=_opts, index=_sidx, key=_key)
+                                    elif _rg_field["type"] == "textarea":
+                                        if _key not in st.session_state:
+                                            st.text_area(_rg_field["label"], value=fv.get(
+                                                _ph, ""), key=_key, placeholder=_hint)
+                                        else:
+                                            st.text_area(
+                                                _rg_field["label"], key=_key, placeholder=_hint)
+                                    else:
+                                        if _key not in st.session_state:
+                                            st.text_input(_rg_field["label"], value=fv.get(
+                                                _ph, ""), key=_key, placeholder=_hint)
+                                        else:
+                                            st.text_input(
+                                                _rg_field["label"], key=_key, placeholder=_hint)
+                            idx = _look
                         else:
                             ph = field["placeholder"]
                             key = f"form_{ph}"
@@ -1129,9 +1204,6 @@ def main() -> None:
 
         _current_vals = _collect_current_values()
         _docx_ctx = dict(_current_vals)
-        for ph in _CM_PLACEHOLDERS:
-            if _docx_ctx.get(ph):
-                _docx_ctx[ph] = _mm_to_cm(_docx_ctx[ph])
 
         # Save original HTML for bullet fields before any conversion
         _orig_html_for_bullets = {
