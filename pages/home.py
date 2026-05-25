@@ -1243,7 +1243,7 @@ def main() -> None:
         st.download_button(
             label="⬇️ 下載表格",
             data=_docx_bytes,
-            file_name="book_form.docx",
+            file_name="新書資料表格.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             type="primary",
             use_container_width=True,
