@@ -6,6 +6,8 @@ Output ONLY a single raw JSON object. Follow these formatting rules strictly:
 - All string values MUST use proper JSON escaping: any double-quote character that appears inside a string value must be escaped as \" (backslash + quote)
 - Alternatively, replace typographic ASCII double-quotes inside Chinese text with Chinese quotation marks「」or『』instead of escaping them — this is preferred for readability
 - Do NOT use unescaped " characters inside any string value under any circumstances
+- Use printable UTF-8 characters directly. Do NOT encode printable characters as Unicode escapes such as \u0022, \u003c, or \u4e2d.
+- For an embedded quote, use \" or Chinese quotation marks「」/『』.
 - The output must parse successfully with JSON.parse() / json.loads() without any errors
 
 Schema (all keys must exist, values can be empty strings when unknown):
@@ -18,12 +20,7 @@ Field-specific rules:
    Example: 30 April 2026 → "30/04/26". May 2026 without a specific day → "01/05/26".
    If the date is not clearly stated in the document, return "".
 
-2. contributor (translator)
-   Return the translator's name ONLY if the document EXPLICITLY labels a person as 譯者 or
-   translator using those exact words or a clear equivalent. If it is not explicitly stated,
-   or you are in any doubt, return "" — do NOT infer or guess from context.
-
-3. synopsis
+2. synopsis
    Return as an HTML-formatted string using ONLY these tags: <b>, <i>, <u>, <ul>, <ol>, <li>.
    - ALWAYS format every point, paragraph, or sentence as a bullet list item: <ul><li>…</li></ul>.
    - If the source has multiple distinct paragraphs, turn EACH paragraph into its own <li> item.
@@ -32,29 +29,48 @@ Field-specific rules:
    - Do NOT use <p> tags. Do NOT include <html>, <body>, <div>, <span>, or any other tags.
    - There must be NO plain text outside of a <li> element.
 
-4. author_bio
+3. author_bio
    Return as an HTML-formatted string. Use ONLY these tags: <b>, <i>, <u>, <p>, <ul>, <ol>, <li>.
    - Wrap each distinct paragraph in <p>…</p>.
    - Convert any list items to <ul><li>…</li></ul> or <ol><li>…</li></ol> as appropriate.
    - Preserve bold, italic, and underline emphasis from the source document.
    - Do NOT include <html>, <body>, <div>, <span>, or any other tags.
 
-5. book_highlights
+4. book_highlights
    Extract the book's key selling points / features section (本書特色及賣點).
    Apply the same HTML bullet-list formatting rules as synopsis (rule 3): always use <ul><li>…</li></ul>, no <p> tags, no plain text outside <li>.
    If no such section exists in the document, return "".
 
-6. language
+5. endorsements
+   Extract 名人推薦 only when the input document contains a clearly identified endorsements, recommendation, testimonial, or 名人推薦 section.
+   Return the available recommendations faithfully as HTML using the allowed tags described for author_bio.
+   If this information is absent, unclear, or not explicitly provided in the document, return "".
+   Never infer, summarize, or invent endorsers, names, quotes, or recommendations from the book's subject or other content.
+
+6. table_of_contents
+   Extract the table of contents only when it is explicitly present in the input document.
+   Return it as HTML using only <p>, <b>, <i>, and <u> tags.
+   Put each source entry on its own plain paragraph with no bullets, numbering, list tags, hanging indents, or leading spaces.
+   Preserve the original entry text and order. If no table of contents is available, return "".
+
+7. target_audience
+   Return a very short plain-text summary of the book's most likely target audience.
+   Use a concise audience description, such as "親子共讀家庭" or "對心理學有興趣的成年人".
+   Infer this only from the document's subject, language, tone, and stated readership.
+   Do not list multiple speculative audiences, explain the reasoning, or repeat the book summary.
+   If the target audience cannot be determined with reasonable confidence, return "".
+
+8. language
    Return as an array of strings. Include ONLY the values that apply from this fixed set:
-   中文, 繁體, 簡體, 英文, 中英對照
+   中文, 繁體, 簡體, 英文, 中英對照, 其他
    Example: a Traditional Chinese book → ["中文", "繁體"]
    Return [] if the language cannot be determined from the document.
 
-7. thickness
-   Book spine thickness (書脊厚度) in mm, as a plain numeric string (e.g. "20").
-   Return "" if the thickness is not stated in the document.
+9. price_hkd and price_twd
+   Return only a non-negative integer containing digits, with no currency symbol, commas, decimal point, words, or other extra text. Zero is valid for a free book.
+   Return "" if the corresponding price is not explicitly provided or is not a non-negative integer.
 
-8. All other string fields
+10. All other string fields
    Return plain text with NO markdown or HTML formatting markers whatsoever.
 
 Examples of CORRECT values:
@@ -62,8 +78,6 @@ Examples of CORRECT values:
   "book_highlights": "<ul><li>全彩印刷，圖文並茂</li><li>適合初學者及進階讀者</li></ul>"
   "author_bio": "<p>曾獲「優秀作家」稱號，著有《論語新解》一書。</p>"
   "publication_date": "30/04/26"
-  "contributor": ""   ← correct when translator is not explicitly stated
-
 Example of WRONG output that breaks JSON parsing:
   "author_bio": "曾獲"優秀作家"稱號"   ← INVALID: unescaped " breaks the JSON
 

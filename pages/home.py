@@ -5,7 +5,6 @@ import re
 import time
 from typing import Any
 
-import requests
 from json_repair import repair_json
 import streamlit as st
 from docx import Document
@@ -14,7 +13,7 @@ from docxtpl import DocxTemplate
 from pydantic import BaseModel, Field, ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from app_config import APP_DIR, PROMPT_FILE, STRAICO_ENDPOINT, STRAICO_MODEL, TEMPLATE_FILE
+from app_config import APP_DIR, PROMPT_FILE, TEMPLATE_FILE, VERTEX_MODEL
 from auth import enforce_workspace_auth
 from debug_store import add_run
 from field_config import CHECKBOX_CHAR, UNCHECKED_CHAR, SECTIONS
@@ -27,6 +26,8 @@ from streamlit_quill import st_quill
 
 class BookFormData(BaseModel):
     title: str | None = ""
+    title_chi: str | None = ""
+    title_eng: str | None = ""
     subtitle: str | None = ""
     series: str | None = ""
     author_name: str | None = ""
@@ -44,10 +45,14 @@ class BookFormData(BaseModel):
     binding: str | None = ""
     print_color: str | None = ""
     price: str | None = ""
+    price_hkd: str | None = ""
+    price_twd: str | None = ""
     contributor: str | None = ""
     editor_notes: str | None = ""
     publisher: str | None = ""
     book_highlights: str | None = ""
+    endorsements: str | None = ""
+    table_of_contents: str | None = ""
     extras: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -157,7 +162,7 @@ def flatten_extracted_data(payload: dict[str, Any]) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Straico helpers
+# Google Vertex helpers
 # ---------------------------------------------------------------------------
 
 def parse_json_from_text(raw_text: str) -> dict[str, Any]:
@@ -191,22 +196,25 @@ def parse_json_from_text(raw_text: str) -> dict[str, Any]:
         except Exception:
             pass
 
-    raise ValueError("無法從 Straico 回應中解析 JSON 物件。")
+    raise ValueError("無法從 Google Vertex 回應中解析 JSON 物件。")
 
 
 def normalize_extracted_payload(payload: dict[str, Any]) -> dict[str, Any]:
     known_keys = {
-        "title", "subtitle", "series", "author_name", "author_bio",
+        "title", "title_chi", "title_eng", "subtitle", "series", "author_name", "author_bio",
         "target_audience", "synopsis", "isbn", "publication_date",
         "language", "category", "keywords", "page_count", "trim_size", "thickness",
-        "binding", "print_color", "price", "contributor", "editor_notes",
-        "publisher", "book_highlights", "extras",
+        "binding", "print_color", "price", "price_hkd", "price_twd", "contributor", "editor_notes",
+        "publisher", "book_highlights", "endorsements", "table_of_contents", "extras",
     }
     extras: dict[str, Any] = payload.get("extras") or {}
     for key, value in payload.items():
         if key not in known_keys:
             extras[key] = value
     data = dict(payload)
+    for price_key in ("price_hkd", "price_twd"):
+        if price_key in data:
+            data[price_key] = _sanitize_non_negative_integer(data[price_key])
     data["extras"] = extras if isinstance(extras, dict) else {}
     return BookFormData.model_validate(data).model_dump()
 
@@ -264,7 +272,7 @@ def build_field_reference() -> str:
     return f"{schema_json}\n\n{label_block}"
 
 
-def compose_straico_prompt(prompt_text: str, document_text: str) -> str:
+def compose_vertex_prompt(prompt_text: str, document_text: str) -> str:
     merged = prompt_text.replace("{FIELD_REFERENCE}", build_field_reference())
     return (
         f"{merged}\n\n"
@@ -274,44 +282,80 @@ def compose_straico_prompt(prompt_text: str, document_text: str) -> str:
     )
 
 
-@retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3), reraise=True)
-def call_straico(api_key: str, model: str, composed_prompt: str) -> tuple[dict[str, Any], str]:
-    """Call Straico and return (parsed_json, raw_response_text)."""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "x-api-key": api_key,
-        "Content-Type": "application/json",
-    }
-    payload_variants = [
-        {"model": model, "prompt": composed_prompt, "temperature": 0},
-        {"models": [model], "prompt": composed_prompt, "temperature": 0},
-        {"model": model, "message": composed_prompt, "temperature": 0},
-    ]
-
-    last_error: Exception | None = None
-    for payload in payload_variants:
-        resp = requests.post(
-            STRAICO_ENDPOINT, headers=headers, json=payload, timeout=90)
-        raw_text = resp.text
-        if resp.status_code >= 400:
-            last_error = RuntimeError(
-                f"Straico 請求失敗，狀態碼 {resp.status_code}。\n{raw_text}"
-            )
-            continue
-
-        data = resp.json()
-        for candidate in _collect_text_candidates(data):
-            try:
-                return parse_json_from_text(candidate), raw_text
-            except Exception:
-                continue
-
+def _parse_google_service_account_info(raw_service_account: Any) -> dict[str, Any]:
+    """Parse and validate service-account JSON from Streamlit secrets."""
+    if isinstance(raw_service_account, str):
         try:
-            return parse_json_from_text(json.dumps(data, ensure_ascii=False)), raw_text
-        except Exception as exc:
-            last_error = exc
+            service_account_info = json.loads(raw_service_account)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "google_vertex.service_account_json 不是有效的 JSON。"
+            ) from exc
+    elif isinstance(raw_service_account, dict):
+        service_account_info = raw_service_account
+    elif hasattr(raw_service_account, "items"):
+        service_account_info = dict(raw_service_account.items())
+    else:
+        raise ValueError(
+            "google_vertex.service_account_json 格式錯誤，需為 JSON 字串或物件。"
+        )
 
-    raise last_error or RuntimeError("Straico 請求因不明原因失敗。")
+    required = ("client_email", "token_uri", "private_key")
+    missing = [key for key in required if not service_account_info.get(key)]
+    if missing:
+        raise ValueError(
+            "Google service account 缺少必要欄位：" + ", ".join(missing)
+        )
+    return service_account_info
+
+
+def get_google_vertex_client() -> Any:
+    """Create a Vertex AI client from the [google_vertex] secrets section."""
+    try:
+        from google import genai
+        from google.oauth2 import service_account
+    except ImportError as exc:
+        raise ValueError(
+            "缺少 Google Vertex 相依套件，請安裝 google-genai 與 google-auth。"
+        ) from exc
+
+    settings = st.secrets.get("google_vertex", {})
+    project_id = settings.get("project_id")
+    location = settings.get("location")
+    raw_service_account = settings.get("service_account_json")
+    if not project_id or not location or not raw_service_account:
+        raise ValueError(
+            "請在 secrets.toml 的 [google_vertex] 提供 project_id、location、"
+            "service_account_json。"
+        )
+
+    credentials = service_account.Credentials.from_service_account_info(
+        _parse_google_service_account_info(raw_service_account),
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    return genai.Client(
+        vertexai=True,
+        project=project_id,
+        location=location,
+        credentials=credentials,
+    )
+
+
+@retry(wait=wait_exponential(multiplier=1, min=1, max=8), stop=stop_after_attempt(3), reraise=True)
+def call_google_vertex(client: Any, model: str, composed_prompt: str) -> tuple[dict[str, Any], str]:
+    """Call Gemini on Vertex AI and return (parsed JSON, raw response text)."""
+    response = client.models.generate_content(
+        model=model,
+        contents=composed_prompt,
+        config={
+            "temperature": 0,
+            "response_mime_type": "application/json",
+        },
+    )
+    raw_text = response.text or ""
+    if not raw_text:
+        raise RuntimeError("Google Vertex 回傳空白回應。")
+    return parse_json_from_text(raw_text), raw_text
 
 
 # ---------------------------------------------------------------------------
@@ -720,12 +764,52 @@ def _field_default(field: dict) -> str:
     return str(d)
 
 
+def _count_visible_fields(section: dict) -> int:
+    """Count configured fields that should be shown in a form section."""
+    return sum(
+        1 for field in section.get("fields", [])
+        if field.get("placeholder") and not field.get("hidden")
+    )
+
+
+def _sanitize_non_negative_integer(value: Any) -> str:
+    """Extract a non-negative integer from a price value, or return blank."""
+    text = str(value or "").strip()
+    if re.search(r"-\s*\d", text):
+        return ""
+    match = re.search(r"(?<![\d.])\d[\d,]*(?![\d.])", text)
+    if not match:
+        return ""
+    digits = match.group(0).replace(",", "")
+    return digits
+
+
+def _ensure_chinese_language(language_key: str) -> None:
+    """Keep 中文 selected whenever 繁體 or 簡體 is selected."""
+    selected = st.session_state.get(language_key, [])
+    if any(label in selected for label in ("繁體", "簡體", "简体")) and "中文" not in selected:
+        st.session_state[language_key] = ["中文", *selected]
+
+
+def _ensure_chinese_checkbox(
+    chinese_key: str,
+    traditional_key: str,
+    simplified_key: str,
+) -> None:
+    """Keep the 中文 checkbox selected for traditional or simplified Chinese."""
+    if st.session_state.get(traditional_key) or st.session_state.get(simplified_key):
+        st.session_state[chinese_key] = True
+
+
 def build_initial_form_values(extracted_flat: dict[str, str]) -> dict[str, str]:
     """Map extracted flat JSON keys → template placeholder names via field_config.
     Falls back to the field's ``default`` value when no AI-extracted value is available.
     """
     trim_size = extracted_flat.get("trim_size", "")
-    lang_str = extracted_flat.get("language", "")
+    raw_language = extracted_flat.get("language", "")
+    lang_str = ", ".join(raw_language) if isinstance(
+        raw_language, list) else str(raw_language)
+    normalized_lang_str = lang_str.replace("简体", "簡體")
 
     # Parse both trim dimensions, then assign larger → 長 (#trim_width) and
     # smaller → 闊 (#trim_height), regardless of order in the source string.
@@ -752,28 +836,23 @@ def build_initial_form_values(extracted_flat: dict[str, str]) -> dict[str, str]:
                 values[ph] = _trim_闊 or _field_default(field)
             elif src.startswith("#lang:"):
                 keyword = src[len("#lang:"):]
-                values[ph] = CHECKBOX_CHAR if keyword in lang_str else UNCHECKED_CHAR
+                language_selected = keyword in normalized_lang_str
+                if keyword == "中文":
+                    language_selected = language_selected or any(
+                        label in normalized_lang_str for label in ("繁體", "簡體")
+                    )
+                values[ph] = CHECKBOX_CHAR if language_selected else UNCHECKED_CHAR
             elif src and src in extracted_flat:
                 raw = extracted_flat[src]
-                if ph == "publishDate":
+                if field.get("type") == "positive_integer":
+                    raw = _sanitize_non_negative_integer(raw)
+                elif ph == "publishDate":
                     raw = _format_date_ddmmyy(raw)
                 elif ph in _CM_PLACEHOLDERS and raw:
                     raw = _mm_to_cm(raw)
                 values[ph] = raw or _field_default(field)
             else:
                 values[ph] = _field_default(field)
-    return values
-
-
-def build_blank_form_values() -> dict[str, str]:
-    """Return a dict of placeholder → default value for a fresh (empty) form."""
-    values: dict[str, str] = {}
-    for section in SECTIONS:
-        for field in section["fields"]:
-            ph = field["placeholder"]
-            if not ph:
-                continue
-            values[ph] = _field_default(field)
     return values
 
 
@@ -789,6 +868,9 @@ def _collect_current_values() -> dict[str, str]:
             if field.get("hidden"):
                 all_vals[ph] = _field_default(field)
                 continue
+            if field["type"] == "option":
+                all_vals[ph] = field["label"]
+                continue
             if field["type"] == "checkbox":
                 val = st.session_state.get(key, False)
                 all_vals[ph] = CHECKBOX_CHAR if val else UNCHECKED_CHAR
@@ -799,6 +881,9 @@ def _collect_current_values() -> dict[str, str]:
                 else:
                     all_vals[ph] = _format_date_ddmmyy(
                         str(_dval)) if _dval else ""
+            elif field["type"] == "positive_integer":
+                all_vals[ph] = _sanitize_non_negative_integer(
+                    st.session_state.get(key, ""))
             elif field["type"] == "html":
                 # st_quill returns None while its iframe is still loading.
                 # _quill_bak_<ph> stores the last confirmed non-None value so
@@ -818,6 +903,18 @@ def _collect_current_values() -> dict[str, str]:
 
 def _clear_form_widget_state() -> None:
     """Remove widget-key session entries so the form re-renders with fresh values."""
+    option_keys = {
+        f"form_option_{group_name}"
+        for group_name in {
+            field["option_group"]
+            for section in SECTIONS
+            for field in section["fields"]
+            if field.get("type") == "option"
+            and field.get("option_mode") == "single"
+        }
+    }
+    for key in option_keys:
+        st.session_state.pop(key, None)
     for section in SECTIONS:
         for field in section["fields"]:
             if not field["placeholder"]:
@@ -829,6 +926,15 @@ def _clear_form_widget_state() -> None:
                 bak = f"_quill_bak_{field['placeholder']}"
                 if bak in st.session_state:
                     del st.session_state[bak]
+            if field.get("type") == "option":
+                st.session_state.pop(key, None)
+    for group_name in {
+        field["option_group"]
+        for section in SECTIONS
+        for field in section["fields"]
+        if field.get("type") == "option"
+    }:
+        st.session_state.pop(f"_option_values_{group_name}", None)
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +950,58 @@ def render_docx_template(template_path: str, context: dict[str, str]) -> bytes:
     return buf.read()
 
 
+def _apply_option_strikethrough(
+    doc_bytes: bytes,
+    option_selections: dict[str, list[str]],
+) -> bytes:
+    """Double-strike unselected visible options in the v2 template."""
+    if not option_selections:
+        return doc_bytes
+
+    doc = Document(io.BytesIO(doc_bytes))
+    from docx.oxml import OxmlElement
+    w_p = qn("w:p")
+    w_r = qn("w:r")
+    w_rpr = qn("w:rPr")
+    w_t = qn("w:t")
+    w_dstrike = qn("w:dstrike")
+    option_groups: dict[str, list[dict]] = {}
+    for section in SECTIONS:
+        for field in section["fields"]:
+            if field.get("type") == "option":
+                option_groups.setdefault(
+                    field["option_group"], []).append(field)
+    for group_name, selected in option_selections.items():
+        group_fields = option_groups.get(group_name)
+        if not group_fields:
+            continue
+        labels = {field["label"]: field["option_value"]
+                  for field in group_fields if field.get("option_value")}
+        for para in doc.part.element.iter(w_p):
+            para_text = "".join(node.text or "" for node in para.iter(w_t))
+            if sum(label in para_text for label in labels) < 2:
+                continue
+            for run in para.iter(w_r):
+                label = "".join(
+                    node.text or "" for node in run.iter(w_t)).strip()
+                if label in labels:
+                    rpr = run.find(w_rpr)
+                    if rpr is None:
+                        rpr = OxmlElement("w:rPr")
+                        run.insert(0, rpr)
+                    existing = rpr.find(w_dstrike)
+                    if labels[label] not in selected:
+                        if existing is None:
+                            rpr.append(OxmlElement("w:dstrike"))
+                    elif existing is not None:
+                        rpr.remove(existing)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
 @st.cache_data(show_spinner=False)
 def _render_docx_cached(template_path: str, context_json: str) -> bytes:
     """Generate DOCX bytes, cached by template path + JSON context."""
@@ -853,15 +1011,6 @@ def _render_docx_cached(template_path: str, context_json: str) -> bytes:
 # ---------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------
-
-def _count_visible_fields(section: dict) -> int:
-    """Count renderable (non-label, non-hidden) fields that have a placeholder."""
-    return sum(
-        1 for f in section["fields"]
-        if f.get("placeholder") and f.get("type") != "label" and not f.get("hidden")
-    )
-
-
 def main() -> None:
     enforce_workspace_auth()
 
@@ -878,7 +1027,7 @@ def main() -> None:
         st.session_state.form_values = {}
 
     if not TEMPLATE_FILE.exists():
-        st.error("專案根目錄找不到 template.docx。")
+        st.error("專案根目錄找不到 template-v2.docx。")
         st.stop()
 
     try:
@@ -887,10 +1036,14 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
 
-    api_key = st.secrets.get("straico", {}).get("api_key", "")
-    if not api_key:
-        st.error("在 .streamlit/secrets.toml 中找不到 [straico].api_key")
+    vertex_settings = st.secrets.get("google_vertex", {})
+    if not vertex_settings.get("project_id") or not vertex_settings.get("location"):
+        st.error(
+            "在 .streamlit/secrets.toml 的 [google_vertex] 中找不到 "
+            "project_id 或 location。"
+        )
         st.stop()
+    vertex_client = None
 
     uploaded_file = st.file_uploader(
         "上傳新書Media Letter Word檔 (docx)，轉換成新書資料表格。", type=["docx"]
@@ -910,19 +1063,21 @@ def main() -> None:
             st.error("無法從上傳 DOCX 擷取可讀文字。")
             st.stop()
 
-        composed_prompt = compose_straico_prompt(prompt_text, document_text)
+        composed_prompt = compose_vertex_prompt(prompt_text, document_text)
 
         start_time = time.monotonic()
 
         with st.spinner("正在透過AI擷取文件內容..."):
             try:
-                raw_json, raw_response = call_straico(
-                    api_key, STRAICO_MODEL, composed_prompt
+                if vertex_client is None:
+                    vertex_client = get_google_vertex_client()
+                raw_json, raw_response = call_google_vertex(
+                    vertex_client, VERTEX_MODEL, composed_prompt
                 )
                 elapsed = time.monotonic() - start_time
                 add_run(
                     file_name=uploaded_file.name,
-                    model=STRAICO_MODEL,
+                    model=VERTEX_MODEL,
                     raw_prompt=composed_prompt,
                     raw_response=raw_response,
                     elapsed_seconds=elapsed,
@@ -940,7 +1095,7 @@ def main() -> None:
                 elapsed = time.monotonic() - start_time
                 add_run(
                     file_name=uploaded_file.name,
-                    model=STRAICO_MODEL,
+                    model=VERTEX_MODEL,
                     raw_prompt=composed_prompt,
                     raw_response="",
                     elapsed_seconds=elapsed,
@@ -949,14 +1104,14 @@ def main() -> None:
                     user_email=getattr(st.user, "email", ""),
                     source_file=input_bytes,
                 )
-                st.error("Straico 回傳的資料格式不符合預期。")
+                st.error("Google Vertex 回傳的資料格式不符合預期。")
                 st.code(str(exc))
                 st.stop()
             except Exception as exc:
                 elapsed = time.monotonic() - start_time
                 add_run(
                     file_name=getattr(uploaded_file, "name", "unknown"),
-                    model=STRAICO_MODEL,
+                    model=VERTEX_MODEL,
                     raw_prompt=composed_prompt,
                     raw_response="",
                     elapsed_seconds=elapsed,
@@ -983,12 +1138,43 @@ def main() -> None:
             if _count_visible_fields(section) > 1:
                 st.subheader(section["title"])
 
-            if layout == "grid":
+            if layout == "options":
+                option_fields = [f for f in fields if f["type"] == "option"]
+                option_labels = [f["label"] for f in option_fields]
+                option_values = {f["label"]: f["option_value"]
+                                 for f in option_fields}
+                option_key = f"form_option_{section['option_group']}"
+                initial = [
+                    field["label"] for field in option_fields
+                    if fv.get(field["placeholder"]) == CHECKBOX_CHAR
+                ]
+                if section.get("option_mode") == "multi":
+                    selected_labels = st.multiselect(
+                        section["title"], options=option_labels,
+                        default=initial, key=option_key)
+                else:
+                    selected_label = st.selectbox(
+                        section["title"], options=[""] + option_labels,
+                        index=(option_labels.index(
+                            initial[0]) + 1) if initial else 0,
+                        key=option_key)
+                    selected_labels = [
+                        selected_label] if selected_label else []
+                st.session_state[f"_option_values_{section['option_group']}"] = [
+                    option_values[label] for label in selected_labels
+                ]
+                for field in fields:
+                    if field["type"] == "text":
+                        ph = field["placeholder"]
+                        st.text_input(field["label"], value=fv.get(
+                            ph, ""), key=f"form_{ph}")
+            elif layout == "grid":
                 # Grid layout: row_group fields share a row; ungrouped fields pair 2-per-row
                 others = [f for f in fields if f["type"]
-                          != "checkbox" and not f.get("hidden")]
+                          not in ("checkbox", "option") and not f.get("hidden")]
                 checkboxes = [f for f in fields if f["type"]
                               == "checkbox" and not f.get("hidden")]
+                embedded_options = [f for f in fields if f["type"] == "option"]
 
                 # Build row batches
                 _row_batches: list[list[dict]] = []
@@ -1019,7 +1205,22 @@ def main() -> None:
                         hint = field.get("hint") or None
                         opts = field.get("options")
                         with col:
-                            if field["type"] == "html":
+                            if field["type"] == "positive_integer":
+                                if key not in st.session_state:
+                                    initial = _sanitize_non_negative_integer(
+                                        fv.get(ph, ""))
+                                    st.number_input(
+                                        field["label"], min_value=0, step=1,
+                                        value=int(
+                                            initial) if initial else None,
+                                        format="%d", key=key,
+                                    )
+                                else:
+                                    st.number_input(
+                                        field["label"], min_value=0, step=1,
+                                        format="%d", key=key,
+                                    )
+                            elif field["type"] == "html":
                                 st.markdown(f"**{field['label']}**")
                                 _qval = st.session_state.get(key)
                                 if _qval is not None:
@@ -1068,6 +1269,53 @@ def main() -> None:
                                             value=default_val, key=key)
                             else:
                                 st.checkbox(field["label"], key=key)
+
+                option_groups: dict[str, list[dict]] = {}
+                for field in embedded_options:
+                    option_groups.setdefault(
+                        field["option_group"], []).append(field)
+                for group_name, group_fields in option_groups.items():
+                    group_title = {
+                        "edition": "版次",
+                        "sales_level": "銷售級別",
+                        "language": "語種",
+                    }.get(group_name, group_name)
+                    option_values = {
+                        field["label"]: field["option_value"] for field in group_fields
+                    }
+                    if group_fields[0].get("option_mode") == "multi":
+                        option_labels = [field["label"]
+                                         for field in group_fields]
+                        initial = [
+                            field["label"] for field in group_fields
+                            if fv.get(field["placeholder"]) == CHECKBOX_CHAR
+                        ]
+                        selected_labels = st.multiselect(
+                            group_title,
+                            options=option_labels,
+                            default=initial,
+                            key=f"form_option_{group_name}",
+                            on_change=_ensure_chinese_language,
+                            args=(f"form_option_{group_name}",),
+                        )
+                    else:
+                        option_key = f"form_option_{group_name}"
+                        initial = next(
+                            (field["label"] for field in group_fields
+                             if fv.get(field["placeholder"]) == CHECKBOX_CHAR),
+                            group_fields[0]["label"],
+                        )
+                        selected_label = st.selectbox(
+                            group_title,
+                            options=[field["label"] for field in group_fields],
+                            index=[field["label"]
+                                   for field in group_fields].index(initial),
+                            key=option_key,
+                        )
+                        selected_labels = [selected_label]
+                    st.session_state[f"_option_values_{group_name}"] = [
+                        option_values[label] for label in selected_labels
+                    ]
             elif layout == "row3":
                 # 3 fields per row: publisher | title | price (competitor rows)
                 visible = [f for f in fields if f.get(
@@ -1130,7 +1378,22 @@ def main() -> None:
                                 _hint = _rg_field.get("hint") or None
                                 _opts = _rg_field.get("options")
                                 with _rg_col:
-                                    if _rg_field["type"] == "date":
+                                    if _rg_field["type"] == "positive_integer":
+                                        if _key not in st.session_state:
+                                            _initial = _sanitize_non_negative_integer(
+                                                fv.get(_ph, ""))
+                                            st.number_input(
+                                                _rg_field["label"], min_value=0, step=1,
+                                                value=int(
+                                                    _initial) if _initial else None,
+                                                format="%d", key=_key,
+                                            )
+                                        else:
+                                            st.number_input(
+                                                _rg_field["label"], min_value=0, step=1,
+                                                format="%d", key=_key,
+                                            )
+                                    elif _rg_field["type"] == "date":
                                         if _key not in st.session_state:
                                             st.date_input(_rg_field["label"], value=_parse_to_date(
                                                 fv.get(_ph, "")), key=_key, format="DD/MM/YYYY")
@@ -1163,7 +1426,22 @@ def main() -> None:
                             key = f"form_{ph}"
                             hint = field.get("hint") or None
                             opts = field.get("options")
-                            if field["type"] == "html":
+                            if field["type"] == "positive_integer":
+                                if key not in st.session_state:
+                                    initial = _sanitize_non_negative_integer(
+                                        fv.get(ph, ""))
+                                    st.number_input(
+                                        field["label"], min_value=0, step=1,
+                                        value=int(
+                                            initial) if initial else None,
+                                        format="%d", key=key,
+                                    )
+                                else:
+                                    st.number_input(
+                                        field["label"], min_value=0, step=1,
+                                        format="%d", key=key,
+                                    )
+                            elif field["type"] == "html":
                                 st.markdown(f"**{field['label']}**")
                                 _qval = st.session_state.get(key)
                                 if _qval is not None:
@@ -1235,11 +1513,24 @@ def main() -> None:
                 _docx_ctx, sort_keys=True, ensure_ascii=False)
         )
 
+        _docx_bytes = _apply_option_strikethrough(
+            _docx_bytes,
+            {
+                group_name: st.session_state.get(
+                    f"_option_values_{group_name}", [])
+                for group_name in {
+                    field["option_group"]
+                    for section in SECTIONS
+                    for field in section["fields"]
+                    if field.get("type") == "option"
+                }
+            },
+        )
+
         # Post-process: replace sentinels with native Word bullet paragraphs
         if _bullet_sentinel_items:
             _docx_bytes = _apply_bullet_formatting(
                 _docx_bytes, _bullet_sentinel_items)
-
         st.download_button(
             label="⬇️ 下載表格",
             data=_docx_bytes,
